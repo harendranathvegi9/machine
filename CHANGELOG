@@ -1,3 +1,44 @@
+2017-03-23: 4.8.3
+- Fixed bug in nice_integer filter. (#586)
+
+2017-03-22: 4.8.2
+- Configured scheduled task to update coverage data. (#584)
+
+2017-03-22: 4.8.1
+- Linked and populated coverage page. (#583)
+
+2017-03-22: 4.8.0
+- Added PostGIS and tables necessary for coverage report. (#582)
+
+2017-03-14: 4.7.0
+- Added RunState.run_id property. (#578)
+
+2017-03-09: 4.6.1
+- Fixed new display bug on jobs pages. (#577)
+
+2017-03-09: 4.6.0
+- Added conversion to/from RunState on all database boundaries. (#576)
+
+2017-03-09: 4.5.2
+- Fixed display bug on jobs pages. (#575)
+
+2017-03-03: 4.5.1
+- Switched to RunState objects for pop_task_from_taskqueue(). (#572)
+- Updated front page text with total source count. (#573)
+
+2017-03-03: 4.5.0
+- Added total address count to GeoJSON renders. (#570)
+
+2017-03-03: 4.4.2
+- Bumped pyesridump version to 1.6.0. (#569)
+
+2017-03-01: 4.4.1
+- Changed comment wording for status updates to include URL. (#568)
+
+2017-03-01: 4.4.0
+- Added public link for slippy map preview with DOTMAPS_BASE_URL config. (#566)
+- Added Vagrantfile for easier local development. (#559)
+
 2017-02-22: 4.3.2
 - Fixed a case-smashing bug in source tests. (#561)
 

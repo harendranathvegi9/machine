@@ -1,6 +1,6 @@
 import logging; _L = logging.getLogger('openaddr.ci.objects')
 
-import json, pickle
+import json, pickle, copy
 
 # Todo: make this a Python 3 enum
 FAIL_REASONS = {
@@ -90,12 +90,13 @@ class RunState:
         'output', 'process time', 'website', 'skipped', 'license',
         'share-alike', 'attribution required', 'attribution name',
         'attribution flag', 'process hash', 'preview', 'slippymap',
-        'source problem', 'code version', 'tests passed')}
+        'source problem', 'code version', 'tests passed', 'run id')}
 
     def __init__(self, json_blob):
         blob_dict = dict(json_blob or {})
         self.keys = blob_dict.keys()
         
+        self.run_id = blob_dict.get('run id')
         self.source = blob_dict.get('source')
         self.cache = blob_dict.get('cache')
         self.sample = blob_dict.get('sample')
@@ -128,9 +129,12 @@ class RunState:
     
     def get(self, json_key):
         return getattr(self, RunState.key_attrs[json_key])
-        
+    
+    def to_dict(self):
+        return {k: self.get(k) for k in self.keys}
+    
     def to_json(self):
-        return json.dumps({k: self.get(k) for k in self.keys})
+        return json.dumps(self.to_dict(), sort_keys=True)
 
 class Zip:
     '''
@@ -139,23 +143,59 @@ class Zip:
         self.url = url
         self.content_length = content_length
 
+def _result_runstate2dictionary(result):
+    '''
+    '''
+    actual_result = copy.copy(result)
+
+    if result and 'state' in result:
+        actual_result['state'] = result['state'].to_dict()
+    elif result and 'output' in result:
+        # old-style
+        actual_result['state'] = result.pop('output').to_dict()
+
+    return actual_result
+
+def result_dictionary2runstate(result):
+    '''
+    '''
+    actual_result = copy.copy(result)
+
+    if result and 'state' in result:
+        actual_result['state'] = RunState(result['state'])
+    elif result and 'output' in result:
+        # old-style
+        actual_result['state'] = RunState(result.pop('output'))
+    elif result:
+        actual_result['state'] = RunState(None)
+
+    return actual_result
+
 def add_job(db, job_id, status, task_files, file_states, file_results, owner, repo, status_url, comments_url):
     ''' Save information about a job to the database.
     
         Throws an IntegrityError exception if the job ID exists.
     '''
+    # Find RunState instances in file_results and turn them into dictionaries.
+    actual_results = {path: _result_runstate2dictionary(result)
+                      for (path, result) in file_results.items()}
+    
     db.execute('''INSERT INTO jobs
                   (task_files, file_states, file_results, github_owner,
                    github_repository, github_status_url, github_comments_url,
                    status, id, datetime_start)
                   VALUES (%s::json, %s::json, %s::json, %s, %s, %s, %s, %s, %s, NOW())''',
-               (json.dumps(task_files), json.dumps(file_states),
-                json.dumps(file_results), owner, repo, status_url,
+               (json.dumps(task_files, sort_keys=True), json.dumps(file_states, sort_keys=True),
+                json.dumps(actual_results, sort_keys=True), owner, repo, status_url,
                 comments_url, status, job_id))
 
 def write_job(db, job_id, status, task_files, file_states, file_results, owner, repo, status_url, comments_url):
     ''' Save information about a job to the database.
     '''
+    # Find RunState instances in file_results and turn them into dictionaries.
+    actual_results = {path: _result_runstate2dictionary(result)
+                      for (path, result) in file_results.items()}
+    
     is_complete = bool(status is not None)
     
     db.execute('''UPDATE jobs
@@ -164,8 +204,8 @@ def write_job(db, job_id, status, task_files, file_states, file_results, owner, 
                       github_status_url=%s, github_comments_url=%s, status=%s,
                       datetime_end=CASE WHEN %s THEN NOW() ELSE null END
                   WHERE id = %s''',
-               (json.dumps(task_files), json.dumps(file_states),
-                json.dumps(file_results), owner, repo, status_url, comments_url,
+               (json.dumps(task_files, sort_keys=True), json.dumps(file_states, sort_keys=True),
+                json.dumps(actual_results, sort_keys=True), owner, repo, status_url, comments_url,
                 status, is_complete, job_id))
 
 def read_job(db, job_id):
@@ -185,7 +225,11 @@ def read_job(db, job_id):
     except TypeError:
         return None
     else:
-        return Job(job_id, status, task_files, states, file_results,
+        # Find dictionaries in file_results and turn them into RunState instances.
+        actual_results = {path: result_dictionary2runstate(result)
+                          for (path, result) in file_results.items()}
+    
+        return Job(job_id, status, task_files, states, actual_results,
                    github_owner, github_repository, github_status_url,
                    github_comments_url, datetime_start, datetime_end)
     
@@ -205,7 +249,18 @@ def read_jobs(db, past_id):
                   ORDER BY sequence DESC LIMIT 25''',
                (past_id, ))
     
-    return [Job(*row) for row in db.fetchall()]
+    jobs = []
+    
+    for row in db.fetchall():
+        # Find dictionaries in file_results and turn them into RunState instances.
+        job_args = list(row)
+        file_results = job_args.pop(4)
+        actual_results = {path: result_dictionary2runstate(result)
+                          for (path, result) in file_results.items()}
+        job_args.insert(4, actual_results)
+        jobs.append(Job(*job_args))
+    
+    return jobs
 
 def add_set(db, owner, repository):
     '''
@@ -367,12 +422,13 @@ def get_completed_file_run(db, file_id, interval):
     
     previous_run = db.fetchone()
     
-    if previous_run:
-        _L.debug('Found previous run {0} ({2}) for file {file_id}'.format(*previous_run, **locals()))
-    else:
+    if previous_run is None:
         _L.debug('No previous run for file {file_id}'.format(**locals()))
+        return None
 
-    return previous_run
+    run_id, state_dict, status = previous_run
+    _L.debug('Found previous run {run_id} ({status}) for file {file_id}'.format(**locals()))
+    return run_id, RunState(state_dict), status
 
 def get_completed_run(db, run_id, min_dtz):
     '''
@@ -385,7 +441,7 @@ def get_completed_run(db, run_id, min_dtz):
     
     return db.fetchone()
 
-def read_completed_set_runs(db, set_id):
+def old_read_completed_set_runs(db, set_id):
     '''
     '''
     db.execute('''SELECT source_id, source_path, source_data, status FROM runs
@@ -394,7 +450,7 @@ def read_completed_set_runs(db, set_id):
     
     return list(db.fetchall())
 
-def new_read_completed_set_runs(db, set_id):
+def read_completed_set_runs(db, set_id):
     '''
     '''
     db.execute('''SELECT id, source_path, source_id, source_data, datetime_tz,
@@ -404,6 +460,16 @@ def new_read_completed_set_runs(db, set_id):
                (set_id, ))
     
     return [Run(*row[:5]+(RunState(row[5]),)+row[6:]) for row in db.fetchall()]
+
+def read_completed_set_runs_count(db, set_id):
+    '''
+    '''
+    db.execute('''SELECT COUNT(*) FROM runs
+                  WHERE set_id = %s AND status IS NOT NULL''',
+               (set_id, ))
+    
+    (count, ) = db.fetchone()
+    return count
 
 def read_completed_source_runs(db, source_path):
     '''

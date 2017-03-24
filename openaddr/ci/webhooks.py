@@ -4,6 +4,7 @@ import logging; _L = logging.getLogger('openaddr.ci.webhooks')
 
 from functools import wraps
 from operator import itemgetter, attrgetter
+from urllib.parse import urlparse, urljoin
 from collections import OrderedDict
 from datetime import datetime
 from dateutil.tz import tzutc
@@ -23,9 +24,10 @@ from . import (
     )
 
 from .objects import (
-    read_job, read_jobs, read_sets, read_set, read_latest_set,
-    read_run, new_read_completed_set_runs, read_completed_runs_to_date,
-    load_collection_zips_dict, read_latest_run, read_completed_source_runs
+    read_job, read_jobs, read_sets, read_set, read_latest_set, RunState,
+    read_run, read_completed_set_runs, read_completed_runs_to_date,
+    load_collection_zips_dict, read_latest_run, read_completed_source_runs,
+    read_completed_set_runs_count
     )
 
 from ..summarize import summarize_runs, GLASS_HALF_FULL, GLASS_HALF_EMPTY, nice_integer, break_state
@@ -89,6 +91,7 @@ def app_index():
             set = read_latest_set(db, 'openaddresses', 'openaddresses')
             runs = read_completed_runs_to_date(db, set and set.id)
             zips = load_collection_zips_dict(db)
+            source_count = read_completed_set_runs_count(db, set.id) if set else None
     
     good_runs, last_modified = list(), datetime.now(tz=tzutc())
 
@@ -107,7 +110,8 @@ def app_index():
         more_runs = 0
 
     return render_template('index.html', s3_bucket=current_app.config['AWS_S3_BUCKET'],
-                           set=None, zips=zips, additional_runs=more_runs, **summary_data)
+                           set=None, zips=zips, additional_runs=more_runs,
+                           source_count=source_count, **summary_data)
 
 @webhooks.route('/hook', methods=['POST'])
 @log_application_errors
@@ -182,7 +186,8 @@ def app_get_job(job_id):
     job = dict(status=job.status, task_files=ordered_files, file_states=job.states,
                file_results=job.file_results, github_status_url=job.github_status_url)
     
-    return render_template('job.html', job=job)
+    return render_template('job.html', job=job,
+                           dotmaps_base_url=current_app.config['DOTMAPS_BASE_URL'])
 
 @webhooks.route('/sets/', methods=['GET'])
 @log_application_errors
@@ -242,7 +247,7 @@ def app_get_set(set_id):
     with db_connect(current_app.config['DATABASE_URL']) as conn:
         with db_cursor(conn) as db:
             set = read_set(db, set_id)
-            runs = new_read_completed_set_runs(db, set.id)
+            runs = read_completed_set_runs(db, set.id)
 
     if set is None:
         return Response('Set {} not found'.format(set_id), 404)
@@ -368,6 +373,22 @@ def nice_size(size):
     else:
         return '{:.0f}{}'.format(size, suffix)
 
+def slippymap_preview_url(runstate):
+    '''
+    '''
+    if runstate.run_id:
+        run_id = str(runstate.run_id)
+
+    elif runstate.slippymap:
+        # Old hack-ass way to get the run ID
+        parsed_url = urlparse(runstate.slippymap)
+        run_id = os.path.basename(os.path.dirname(parsed_url.path))
+
+    else:
+        raise ValueError()
+
+    return urljoin(current_app.config['DOTMAPS_BASE_URL'], run_id)
+
 def apply_webhooks_blueprint(app):
     '''
     '''
@@ -383,6 +404,8 @@ def apply_webhooks_blueprint(app):
         app.jinja_env.filters['nice_timedelta'] = nice_timedelta
         app.jinja_env.filters['breakstate'] = break_state
         app.jinja_env.filters['nice_size'] = nice_size
+        
+        app.jinja_env.filters['slippymap_preview_url'] = slippymap_preview_url
 
         setup_logger(None,
                      None,

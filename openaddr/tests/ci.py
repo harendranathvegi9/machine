@@ -29,7 +29,7 @@ from ..ci import (
     create_queued_job, TASK_QUEUE, DONE_QUEUE, DUE_QUEUE,
     enqueue_sources, find_batch_sources, render_set_maps, render_index_maps,
     is_merged_to_master, get_commit_info, HEARTBEAT_QUEUE, flush_heartbeat_queue,
-    get_recent_workers, load_config, get_batch_run_times, webauth,
+    get_recent_workers, load_config, get_batch_run_times, webauth, webcoverage,
     process_github_payload, skip_payload, is_rerun_payload, update_job_comments,
     reset_logger
     )
@@ -38,9 +38,10 @@ from ..ci.objects import (
     add_job, write_job, read_job, read_jobs, Job,
     Set, add_set, complete_set, update_set_renders, read_set, read_sets,
     add_run, set_run, copy_run, get_completed_file_run, get_completed_run,
-    read_completed_set_runs, new_read_completed_set_runs, read_latest_set,
+    old_read_completed_set_runs, read_completed_set_runs, read_latest_set,
     read_run, read_completed_runs_to_date, read_latest_run, Run, RunState,
-    read_completed_source_runs
+    read_completed_source_runs, read_completed_set_runs_count,
+    result_dictionary2runstate
     )
 
 from ..ci.collect import (
@@ -54,7 +55,7 @@ from ..ci.tileindex import (
     )
 
 from ..jobs import JOB_TIMEOUT
-from ..ci.work import make_source_filename, assemble_output, MAGIC_OK_MESSAGE
+from ..ci.work import make_source_filename, assemble_runstate, MAGIC_OK_MESSAGE
 from ..ci.webhooks import apply_webhooks_blueprint
 from ..ci.webapi import apply_webapi_blueprint
 from .. import LocalProcessedResult
@@ -90,7 +91,8 @@ class TestObjects (unittest.TestCase):
         keys = ('source', 'cache', 'sample', 'geometry type', 'processed',
             'address count', 'version', 'fingerprint', 'cache time',
             'output', 'process time', 'website', 'skipped', 'license',
-            'share-alike', 'attribution required', 'attribution name')
+            'share-alike', 'attribution required', 'attribution name',
+            'run id')
         
         for key in keys:
             value = str(uuid4())
@@ -99,6 +101,12 @@ class TestObjects (unittest.TestCase):
             
             attr = key.replace(' ', '_').replace('-', '_')
             self.assertEqual(getattr(state, attr), value)
+
+        # special case for run id
+        value = str(uuid4())
+        state = RunState({'run id': value})
+        self.assertEqual(state.get('run id'), value)
+        self.assertEqual(state.run_id, value)
 
         # special case for source problem
         value = None
@@ -121,7 +129,8 @@ class TestObjects (unittest.TestCase):
     def test_add_job(self):
         ''' Check behavior of objects.add_job()
         '''
-        add_job(self.db, 'xyz', True, {}, {}, {}, 'o', 'a', 'http://', 'https://')
+        results = {'sources/file.json': {'message': 'Yo', 'state': RunState({'source': 'file.txt'})}}
+        add_job(self.db, 'xyz', True, {}, {}, results, 'o', 'a', 'http://', 'https://')
 
         self.db.execute.assert_called_once_with(
                '''INSERT INTO jobs
@@ -129,12 +138,36 @@ class TestObjects (unittest.TestCase):
                    github_repository, github_status_url, github_comments_url,
                    status, id, datetime_start)
                   VALUES (%s::json, %s::json, %s::json, %s, %s, %s, %s, %s, %s, NOW())''',
-                  ('{}', '{}', '{}', 'o', 'a', 'http://', 'https://', True, 'xyz'))
+                  ('{}', '{}', '{"sources/file.json": {"message": "Yo", "state": {"source": "file.txt"}}}',
+                   'o', 'a', 'http://', 'https://', True, 'xyz'))
 
+    def test_result_dictionary2runstate(self):
+        '''
+        '''
+        result1 = {'message': 'Yo', 'state': {'source': 'Hello'}}
+        result1b = result_dictionary2runstate(result1)
+        self.assertEqual(result1b['message'], 'Yo')
+        self.assertEqual(result1b['state'].source, 'Hello')
+
+        result2 = {'message': 'Yo', 'output': {'source': 'Hello'}}
+        result2b = result_dictionary2runstate(result2)
+        self.assertEqual(result2b['message'], 'Yo')
+        self.assertEqual(result2b['state'].source, 'Hello')
+
+        result3 = {'message': 'Yo'}
+        result3b = result_dictionary2runstate(result3)
+        self.assertEqual(result3b['message'], 'Yo')
+        self.assertIsNone(result3b['state'].source)
+
+        result4 = None
+        result4b = result_dictionary2runstate(result4)
+        self.assertIsNone(result4b)
+    
     def test_write_job_success(self):
         ''' Check behavior of objects.write_job()
         '''
-        write_job(self.db, 'xyz', True, {}, {}, {}, 'o', 'a', 'http://', 'https://')
+        results = {'sources/file.json': {'message': 'Yo', 'state': RunState({'source': 'file.txt'})}}
+        write_job(self.db, 'xyz', True, {}, {}, results, 'o', 'a', 'http://', 'https://')
 
         self.db.execute.assert_called_once_with(
                '''UPDATE jobs
@@ -143,12 +176,14 @@ class TestObjects (unittest.TestCase):
                       github_status_url=%s, github_comments_url=%s, status=%s,
                       datetime_end=CASE WHEN %s THEN NOW() ELSE null END
                   WHERE id = %s''',
-                  ('{}', '{}', '{}', 'o', 'a', 'http://', 'https://', True, True, 'xyz'))
+                  ('{}', '{}', '{"sources/file.json": {"message": "Yo", "state": {"source": "file.txt"}}}',
+                   'o', 'a', 'http://', 'https://', True, True, 'xyz'))
 
     def test_write_job_failure(self):
         ''' Check behavior of objects.write_job()
         '''
-        write_job(self.db, 'xyz', False, {}, {}, {}, 'o', 'a', 'http://', 'https://')
+        results = {'sources/file.json': {'message': 'Yo', 'state': RunState({'source': 'file.txt'})}}
+        write_job(self.db, 'xyz', False, {}, {}, results, 'o', 'a', 'http://', 'https://')
 
         self.db.execute.assert_called_once_with(
                '''UPDATE jobs
@@ -157,12 +192,14 @@ class TestObjects (unittest.TestCase):
                       github_status_url=%s, github_comments_url=%s, status=%s,
                       datetime_end=CASE WHEN %s THEN NOW() ELSE null END
                   WHERE id = %s''',
-                  ('{}', '{}', '{}', 'o', 'a', 'http://', 'https://', False, True, 'xyz'))
+                  ('{}', '{}', '{"sources/file.json": {"message": "Yo", "state": {"source": "file.txt"}}}',
+                   'o', 'a', 'http://', 'https://', False, True, 'xyz'))
 
     def test_write_job_ongoing(self):
         ''' Check behavior of objects.write_job()
         '''
-        write_job(self.db, 'xyz', None, {}, {}, {}, 'o', 'a', 'http://', 'https://')
+        results = {'sources/file.json': {'message': 'Yo', 'state': RunState({'source': 'file.txt'})}}
+        write_job(self.db, 'xyz', None, {}, {}, results, 'o', 'a', 'http://', 'https://')
 
         self.db.execute.assert_called_once_with(
                '''UPDATE jobs
@@ -171,12 +208,13 @@ class TestObjects (unittest.TestCase):
                       github_status_url=%s, github_comments_url=%s, status=%s,
                       datetime_end=CASE WHEN %s THEN NOW() ELSE null END
                   WHERE id = %s''',
-                  ('{}', '{}', '{}', 'o', 'a', 'http://', 'https://', None, False, 'xyz'))
+                  ('{}', '{}', '{"sources/file.json": {"message": "Yo", "state": {"source": "file.txt"}}}',
+                   'o', 'a', 'http://', 'https://', None, False, 'xyz'))
 
     def test_read_job_yes(self):
         ''' Check behavior of objects.read_job()
         '''
-        self.db.fetchone.return_value = True, {}, {}, {}, 'o', 'a', 'http://', 'https://', None, None
+        self.db.fetchone.return_value = True, {}, {}, {"sources/file.json": {"message": "Yo", "state": {"source": "file.txt"}}}, 'o', 'a', 'http://', 'https://', None, None
         
         job = read_job(self.db, 'xyz')
         self.assertEqual(job.id, 'xyz')
@@ -185,6 +223,9 @@ class TestObjects (unittest.TestCase):
         self.assertEqual(job.github_repository, 'a')
         self.assertEqual(job.github_status_url, 'http://')
         self.assertEqual(job.github_comments_url, 'https://')
+        self.assertIn('sources/file.json', job.file_results)
+        self.assertEqual(job.file_results['sources/file.json']['message'], 'Yo')
+        self.assertEqual(job.file_results['sources/file.json']['state'].source, 'file.txt')
         self.assertIsNone(job.datetime_start)
         self.assertIsNone(job.datetime_end)
 
@@ -195,6 +236,16 @@ class TestObjects (unittest.TestCase):
                   FROM jobs WHERE id = %s
                   LIMIT 1''',
                   ('xyz', ))
+
+    def test_read_job_old(self):
+        ''' Check old-dict behavior of objects.read_job()
+        '''
+        self.db.fetchone.return_value = True, {}, {}, {"sources/file.json": {"message": "Yo", "output": {"source": "file.txt"}}}, 'o', 'a', 'http://', 'https://', None, None
+        
+        job = read_job(self.db, 'xyz')
+        self.assertIn('sources/file.json', job.file_results)
+        self.assertEqual(job.file_results['sources/file.json']['message'], 'Yo')
+        self.assertEqual(job.file_results['sources/file.json']['state'].source, 'file.txt')
 
     def test_read_job_no(self):
         ''' Check behavior of objects.read_job()
@@ -215,11 +266,14 @@ class TestObjects (unittest.TestCase):
     def test_read_jobs(self):
         ''' Check behavior of objects.read_jobs()
         '''
-        self.db.fetchall.return_value = (('xyz', True, {}, {}, {}, 'o', 'a', 'http://', 'https://', None, None), )
+        self.db.fetchall.return_value = (('xyz', True, {}, {}, {"sources/file.json": {"message": "Yo", "state": {"source": "file.txt"}}}, 'o', 'a', 'http://', 'https://', None, None), )
         
         (job, ) = read_jobs(self.db, None)
         self.assertEqual(job.id, 'xyz')
         self.assertEqual(job.status, True)
+        self.assertIn('sources/file.json', job.file_results)
+        self.assertEqual(job.file_results['sources/file.json']['message'], 'Yo')
+        self.assertEqual(job.file_results['sources/file.json']['state'].source, 'file.txt')
 
         self.db.execute.assert_called_once_with(
                '''SELECT id, status, task_files, file_states, file_results,
@@ -448,10 +502,12 @@ class TestObjects (unittest.TestCase):
     def test_get_completed_file_run_yes(self):
         ''' Check behavior of objects.get_completed_file_run_yes()
         '''
-        self.db.fetchone.return_value = (456, True, {})
+        self.db.fetchone.return_value = (456, {'source': 'example'}, True)
         
         run_id, state, status = get_completed_file_run(self.db, 'abc', timedelta(0))
         self.assertEqual(run_id, 456)
+        self.assertEqual(state.source, 'example')
+        self.assertIs(status, True)
 
         self.db.execute.assert_called_once_with(
                '''SELECT id, state, status FROM runs
@@ -511,12 +567,12 @@ class TestObjects (unittest.TestCase):
                     LIMIT 1''',
                   (456, now))
 
-    def test_read_completed_set_runs(self):
-        ''' Check behavior of objects.read_completed_set_runs()
+    def test_old_read_completed_set_runs(self):
+        ''' Check behavior of objects.old_read_completed_set_runs()
         '''
         self.db.fetchall.return_value = (('abc', 'pl', b'', True), )
         
-        ((source_id, source_path, source_data, status), ) = read_completed_set_runs(self.db, 123)
+        ((source_id, source_path, source_data, status), ) = old_read_completed_set_runs(self.db, 123)
         self.assertEqual(source_id, 'abc')
         self.assertEqual(source_path, 'pl')
         self.assertEqual(source_data, b'')
@@ -527,13 +583,13 @@ class TestObjects (unittest.TestCase):
                   WHERE set_id = %s AND status IS NOT NULL''',
                   (123, ))
 
-    def test_new_read_completed_set_runs(self):
-        ''' Check behavior of objects.new_read_completed_set_runs()
+    def test_read_completed_set_runs(self):
+        ''' Check behavior of objects.read_completed_set_runs()
         '''
         self.db.fetchall.return_value = (('abc', 'sources/whatever.json', 'jkl',
             b'', None, {}, True, None, '', '', 'mno', 123, 'abc', False), )
         
-        runs = new_read_completed_set_runs(self.db, 123)
+        runs = read_completed_set_runs(self.db, 123)
         self.assertEqual(runs[0].id, 'abc')
         self.assertEqual(runs[0].source_path, 'sources/whatever.json')
         self.assertEqual(runs[0].source_data, b'')
@@ -544,6 +600,19 @@ class TestObjects (unittest.TestCase):
                '''SELECT id, source_path, source_id, source_data, datetime_tz,
                          state, status, copy_of, code_version, worker_id,
                          job_id, set_id, commit_sha, is_merged FROM runs
+                  WHERE set_id = %s AND status IS NOT NULL''',
+                  (123, ))
+    
+    def test_read_completed_set_runs_count(self):
+        ''' Check behavior of objects.read_completed_set_runs_count()
+        '''
+        self.db.fetchone.return_value = (99, )
+        
+        count = read_completed_set_runs_count(self.db, 123)
+        self.assertEqual(count, 99)
+
+        self.db.execute.assert_called_once_with(
+               '''SELECT COUNT(*) FROM runs
                   WHERE set_id = %s AND status IS NOT NULL''',
                   (123, ))
     
@@ -1138,6 +1207,7 @@ class TestAuth (unittest.TestCase):
             app.config.update(load_config(), MINIMUM_LOGLEVEL=logging.CRITICAL)
             apply_webhooks_blueprint(app)
             webauth.apply_webauth_blueprint(app)
+            webcoverage.apply_coverage_blueprint(app)
         
             client = app.test_client()
         
@@ -1194,10 +1264,12 @@ class TestHook (unittest.TestCase):
         os.environ['WEBHOOK_SECRETS'] = 'hello,world'
         os.environ['AWS_ACCESS_KEY_ID'] = '12345'
         os.environ['AWS_SECRET_ACCESS_KEY'] = '67890'
+        os.environ['DOTMAPS_BASE_URL'] = 'https://dotmaps.example.com/yo/'
 
         self.app = Flask(__name__)
         self.app.config.update(load_config(), MINIMUM_LOGLEVEL=logging.CRITICAL)
         apply_webhooks_blueprint(self.app)
+        webcoverage.apply_coverage_blueprint(self.app)
 
         recreate_db.recreate(self.app.config['DATABASE_URL'])
 
@@ -2200,10 +2272,41 @@ class TestHook (unittest.TestCase):
 
         with db_connect(self.database_url) as conn:
             with db_cursor(conn) as db:
-                add_job(db, 'abc', True, {}, {}, {}, 'oa', 'oa', None, None)
+                state1 = RunState({
+                    'output': 'http://example.com/998/log.txt',
+                    'sample': 'http://example.com/998/sample.json',
+                    'processed': 'http://example.com/998/stuff.zip',
+                    'preview': 'http://example.com/998/preview.png',
+                    'slippymap': 'http://example.com/998/tiles.mbtiles'
+                    })
+                state2 = RunState({
+                    'output': 'http://example.com/999/log.txt',
+                    'sample': 'http://example.com/999/sample.json',
+                    'processed': 'http://example.com/999/stuff.zip',
+                    'preview': 'http://example.com/999/preview.png',
+                    'slippymap': 'http://example.org/tiles.mbtiles',
+                    'run id': 999
+                    })
+                add_job(db, 'abc', True, {'this': 'foo', 'that': 'bar'},
+                       {'foo': True, 'bar': True},
+                       {'foo': {'state': state1}, 'bar': {'state': state2}},
+                       'oa', 'oa', None, None)
 
-        got1 = self.client.get('/jobs/abc')
-        self.assertEqual(got1.status_code, 200)
+        got2 = self.client.get('/jobs/abc')
+        body2 = got2.data.decode('utf8')
+        self.assertEqual(got2.status_code, 200)
+
+        self.assertIn('http://example.com/998/log.txt', body2)
+        self.assertIn('http://example.com/998/sample.json', body2)
+        self.assertIn('http://example.com/998/stuff.zip', body2)
+        self.assertIn('http://example.com/998/preview.png', body2)
+        self.assertIn('https://dotmaps.example.com/yo/998', body2)
+
+        self.assertIn('http://example.com/999/log.txt', body2)
+        self.assertIn('http://example.com/999/sample.json', body2)
+        self.assertIn('http://example.com/999/stuff.zip', body2)
+        self.assertIn('http://example.com/999/preview.png', body2)
+        self.assertIn('https://dotmaps.example.com/yo/999', body2)
     
 class TestRuns (unittest.TestCase):
 
@@ -2295,7 +2398,7 @@ class TestRuns (unittest.TestCase):
         source_id, source_path = '0xDEADBEEF', 'sources/us-ca-oakland.json'
         
         def returns_plausible_result(s3, run_id, source_name, content, render_preview, output_dir, mapzen_key):
-            return dict(message=MAGIC_OK_MESSAGE, output={"source": "user_input.txt"})
+            return dict(message=MAGIC_OK_MESSAGE, state=RunState({"source": "user_input.txt"}))
         
         do_work.side_effect = returns_plausible_result
 
@@ -2420,7 +2523,7 @@ class TestRuns (unittest.TestCase):
         ''' Test a run that succeeds past its due date.
         '''
         def returns_plausible_result(s3, run_id, source_name, content, render_preview, output_dir, mapzen_key):
-            return dict(message=MAGIC_OK_MESSAGE, output={"source": "user_input.txt"})
+            return dict(message=MAGIC_OK_MESSAGE, state=RunState({"source": "user_input.txt"}))
 
         do_work.side_effect = returns_plausible_result
 
@@ -2585,7 +2688,8 @@ class TestRuns (unittest.TestCase):
         fprint = itertools.count(1)
         
         def returns_plausible_result(s3, run_id, source_name, content, render_preview, output_dir, mapzen_key):
-            return dict(message='Something went wrong', output={"source": "user_input.txt", "fingerprint": next(fprint)}, result_code=0, result_stdout='...')
+            return dict(message='Something went wrong', result_code=0, result_stdout='...',
+                        state=RunState({"source": "user_input.txt", "fingerprint": next(fprint)}))
         
         def raises_an_error(s3, run_id, source_name, content, output_dir):
             raise Exception('Worker did not know to re-use previous run')
@@ -2691,7 +2795,7 @@ class TestRuns (unittest.TestCase):
         fprint = itertools.count(1)
         
         def returns_plausible_result(s3, run_id, source_name, content, render_preview, output_dir, mapzen_key):
-            return dict(message=MAGIC_OK_MESSAGE, output={"source": "user_input.txt", "fingerprint": next(fprint)})
+            return dict(message=MAGIC_OK_MESSAGE, state=RunState({"source": "user_input.txt", "fingerprint": next(fprint)}))
         
         fake_queued_job_args = list(self.fake_queued_job_args[:])
         fake_queued_job_args[2] = True # rerun is true
@@ -2766,7 +2870,8 @@ class TestRuns (unittest.TestCase):
         fprint = itertools.count(1)
         
         def returns_plausible_result(s3, run_id, source_name, content, render_preview, output_dir, mapzen_key):
-            return dict(message=MAGIC_OK_MESSAGE, output={"source": "user_input.txt", "fingerprint": next(fprint)}, result_code=0, result_stdout='...')
+            return dict(message=MAGIC_OK_MESSAGE, result_code=0, result_stdout='...',
+                        state=RunState({"source": "user_input.txt", "fingerprint": next(fprint)}))
         
         do_work.side_effect = returns_plausible_result
 
@@ -2842,8 +2947,8 @@ class TestWorker (unittest.TestCase):
         self.assertEqual(make_source_filename(u'yo/yo'), u'yo--yo.txt')
         self.assertEqual(make_source_filename(u'yó/yó'), u'yó--yó.txt')
     
-    def test_assemble_output_runstate(self):
-        ''' Test that return value of assemble_output() works for RunState.
+    def test_assemble_runstate(self):
+        ''' Test that assemble_runstate() puts the right values in RunState.
         '''
         s3 = mock.Mock()
         s3.new_key.return_value.md5 = b'0xWHATEVER'
@@ -2851,8 +2956,9 @@ class TestWorker (unittest.TestCase):
         s3.new_key.return_value.bucket.name = 'a-bucket'
 
         input1 = {'cache': False, 'sample': False, 'processed': False, 'output': False, 'preview': False, 'slippymap': False}
-        state1 = RunState(assemble_output(s3, input1, 'xx/f', 1, 'dir'))
+        state1 = assemble_runstate(s3, input1, 'xx/f', 1, 'dir')
 
+        self.assertEqual(state1.run_id, 1)
         self.assertEqual(state1.cache, input1['cache'])
         self.assertEqual(state1.sample, input1['sample'])
         self.assertEqual(state1.processed, input1['processed'])
@@ -2861,8 +2967,9 @@ class TestWorker (unittest.TestCase):
         self.assertEqual(state1.slippymap, input1['slippymap'])
 
         input2 = {'cache': 'cache.csv', 'sample': False, 'processed': False, 'output': False, 'preview': False, 'slippymap': False}
-        state2 = RunState(assemble_output(s3, input2, 'xx/f', 2, 'dir'))
+        state2 = assemble_runstate(s3, input2, 'xx/f', 2, 'dir')
 
+        self.assertEqual(state2.run_id, 2)
         self.assertEqual(state2.cache, 'https://s3.amazonaws.com/a-bucket/a-key')
         self.assertEqual(state2.fingerprint, '0xWHATEVER')
         self.assertEqual(state2.sample, input2['sample'])
@@ -2873,8 +2980,9 @@ class TestWorker (unittest.TestCase):
         self.assertEqual(s3.new_key.mock_calls[-2], mock.call('/runs/2/cache.csv'))
 
         input3 = {'cache': False, 'sample': 'sample.json', 'processed': False, 'output': False, 'preview': False, 'slippymap': False}
-        state3 = RunState(assemble_output(s3, input3, 'xx/f', 3, 'dir'))
+        state3 = assemble_runstate(s3, input3, 'xx/f', 3, 'dir')
 
+        self.assertEqual(state3.run_id, 3)
         self.assertEqual(state3.cache, input3['cache'])
         self.assertEqual(state3.sample, 'https://s3.amazonaws.com/a-bucket/a-key')
         self.assertEqual(state3.processed, input3['processed'])
@@ -2884,8 +2992,9 @@ class TestWorker (unittest.TestCase):
         self.assertEqual(s3.new_key.mock_calls[-2], mock.call('/runs/3/sample.json'))
 
         input4 = {'cache': False, 'sample': False, 'processed': False, 'output': 'out.txt', 'preview': False, 'slippymap': False}
-        state4 = RunState(assemble_output(s3, input4, 'xx/f', 4, 'dir'))
+        state4 = assemble_runstate(s3, input4, 'xx/f', 4, 'dir')
 
+        self.assertEqual(state4.run_id, 4)
         self.assertEqual(state4.cache, input4['cache'])
         self.assertEqual(state4.sample, input4['sample'])
         self.assertEqual(state4.processed, input4['processed'])
@@ -2897,8 +3006,9 @@ class TestWorker (unittest.TestCase):
         with patch('openaddr.util.package_output') as package_output:
             package_output.return_value = 'nothing.zip'
             input5 = {'cache': False, 'sample': False, 'processed': 'data.zip', 'output': False, 'preview': False, 'slippymap': False}
-            state5 = RunState(assemble_output(s3, input5, 'xx/f', 5, 'dir'))
+            state5 = assemble_runstate(s3, input5, 'xx/f', 5, 'dir')
 
+        self.assertEqual(state5.run_id, 5)
         self.assertEqual(state5.cache, input5['cache'])
         self.assertEqual(state5.sample, input5['sample'])
         self.assertEqual(state5.processed, 'https://s3.amazonaws.com/a-bucket/a-key')
@@ -2909,8 +3019,9 @@ class TestWorker (unittest.TestCase):
         self.assertEqual(s3.new_key.mock_calls[-2], mock.call('/runs/5/xx/f.zip'))
 
         input6 = {'cache': False, 'sample': False, 'processed': False, 'output': False, 'preview': 'preview.png', 'slippymap': False}
-        state6 = RunState(assemble_output(s3, input6, 'xx/f', 6, 'dir'))
+        state6 = assemble_runstate(s3, input6, 'xx/f', 6, 'dir')
 
+        self.assertEqual(state6.run_id, 6)
         self.assertEqual(state6.cache, input6['cache'])
         self.assertEqual(state6.sample, input6['sample'])
         self.assertEqual(state6.processed, input6['processed'])
@@ -2920,8 +3031,9 @@ class TestWorker (unittest.TestCase):
         self.assertEqual(s3.new_key.mock_calls[-2], mock.call('/runs/6/preview.png'))
 
         input7 = {'cache': False, 'sample': False, 'processed': False, 'output': False, 'preview': False, 'slippymap': 'slippymap.mbtiles'}
-        state7 = RunState(assemble_output(s3, input7, 'xx/f', 7, 'dir'))
+        state7 = assemble_runstate(s3, input7, 'xx/f', 7, 'dir')
 
+        self.assertEqual(state7.run_id, 7)
         self.assertEqual(state7.cache, input7['cache'])
         self.assertEqual(state7.sample, input7['sample'])
         self.assertEqual(state7.processed, input7['processed'])
@@ -2976,16 +3088,17 @@ class TestWorker (unittest.TestCase):
         self.assertEqual(result['message'], MAGIC_OK_MESSAGE)
         self.assertEqual(result['result_code'], 0)
 
-        self.assertFalse(result['output']['skipped'])
-        self.assertTrue(result['output']['cache'].endswith('/cache.zip'))
-        self.assertTrue(result['output']['sample'].endswith('/sample.json'))
-        self.assertTrue(result['output']['output'].endswith('/output.txt'))
-        self.assertTrue(result['output']['preview'].endswith('/preview.png'))
-        self.assertTrue(result['output']['processed'].endswith(u'/so/exalté.zip'))
-        self.assertEqual(result['output']['website'], 'http://example.com')
-        self.assertEqual(result['output']['license'], 'GPL')
+        self.assertFalse(result['state'].skipped)
+        self.assertTrue(result['state'].cache.endswith('/cache.zip'))
+        self.assertTrue(result['state'].sample.endswith('/sample.json'))
+        self.assertTrue(result['state'].output.endswith('/output.txt'))
+        self.assertTrue(result['state'].preview.endswith('/preview.png'))
+        self.assertTrue(result['state'].processed.endswith(u'/so/exalté.zip'))
+        self.assertEqual(result['state'].website, 'http://example.com')
+        self.assertEqual(result['state'].license, 'GPL')
+        self.assertEqual(result['state'].run_id, -1)
         
-        zip_path = urlparse(result['output']['processed']).path
+        zip_path = urlparse(result['state'].processed).path
         zip_bytes = self.s3._read_fake_key(zip_path[len('/fake-bucket'):])
         zip_file = ZipFile(BytesIO(zip_bytes), mode='r')
         self.assertTrue(u'README.txt' in zip_file.namelist())
@@ -3079,11 +3192,12 @@ class TestWorker (unittest.TestCase):
         self.assertEqual(result['message'], MAGIC_OK_MESSAGE)
         self.assertEqual(result['result_code'], 0)
 
-        self.assertTrue(result['output']['skipped'])
-        self.assertIsNone(result['output']['cache'])
-        self.assertIsNone(result['output']['sample'])
-        self.assertIsNone(result['output']['license'])
-        self.assertIsNone(result['output']['processed'])
+        self.assertTrue(result['state'].skipped)
+        self.assertIsNone(result['state'].cache)
+        self.assertIsNone(result['state'].sample)
+        self.assertIsNone(result['state'].license)
+        self.assertIsNone(result['state'].processed)
+        self.assertEqual(result['state'].run_id, -1)
 
 class TestBatch (unittest.TestCase):
 
@@ -3314,7 +3428,7 @@ class TestBatch (unittest.TestCase):
         ''' Show that the tasks enqueued in a batch context can be run.
         '''
         def returns_plausible_result(s3, run_id, source_name, content, render_preview, output_dir, mapzen_key):
-            return dict(message=MAGIC_OK_MESSAGE, output={"source": "user_input.txt"})
+            return dict(message=MAGIC_OK_MESSAGE, state=RunState({"source": "user_input.txt"}))
         
         do_work.side_effect = returns_plausible_result
 
@@ -3375,7 +3489,7 @@ class TestBatch (unittest.TestCase):
         ''' Show that a batch context will result in rendered maps.
         '''
         def returns_plausible_result(s3, run_id, source_name, content, render_preview, output_dir, mapzen_key):
-            return dict(message=MAGIC_OK_MESSAGE, output={"source": "user_input.txt"})
+            return dict(message=MAGIC_OK_MESSAGE, state=RunState({"source": "user_input.txt", "address count": 999}))
         
         do_work.side_effect = returns_plausible_result
 
@@ -3411,6 +3525,19 @@ class TestBatch (unittest.TestCase):
             self.assertEqual(get(the_set.render_europe).status_code, 200)
             self.assertEqual(get(the_set.render_world).status_code, 200)
             self.assertEqual(get(the_set.render_geojson).status_code, 200)
+            
+            geojson = json.loads(get(the_set.render_geojson).content.decode('utf8'))
+            properties = [feat['properties'] for feat in geojson['features']]
+            
+            self.assertEqual(properties[0]['name'], 'Contra Costa')
+            self.assertEqual(properties[0]['address count'], 999)
+            self.assertEqual(properties[0]['source count'], 1)
+            self.assertEqual(properties[1]['name'], 'Nevada')
+            self.assertEqual(properties[1]['address count'], 999)
+            self.assertEqual(properties[1]['source count'], 1)
+            self.assertEqual(properties[2]['name'], 'Alameda')
+            self.assertEqual(properties[2]['address count'], 999)
+            self.assertEqual(properties[2]['source count'], 1)
     
     def test_render_index_maps(self):
         ''' Show that front page maps get rendered correctly.
@@ -3495,7 +3622,190 @@ class TestQueue (unittest.TestCase):
         self.assertEqual(run_data[6:], (False, 'j', None, 'sss', is_merged_to_master.return_value, None))
         
         job_data = update_job_status.mock_calls[0][1]
-        self.assertEqual(job_data[1:6], ('j', 'u', 'sources/xx/f.json', False, {'message': 'Yo', 'output': output_data}))
+        self.assertEqual(job_data[1:5], ('j', 'u', 'sources/xx/f.json', False))
+        self.assertEqual(job_data[5]['message'], 'Yo')
+        self.assertEqual(job_data[5]['state'].source, 'sources/xx/f.json')
+        self.assertEqual(job_data[5]['state'].process_hash, 'f00')
+    
+    @patch('openaddr.ci.WORKER_COOLDOWN', new=timedelta(seconds=0))
+    @patch('openaddr.ci.work.do_work')
+    @patch('openaddr.ci.objects.get_completed_file_run')
+    @patch('openaddr.ci.objects.add_run')
+    def test_pop_task_from_taskqueue_no_data(self, add_run, get_completed_file_run, do_work):
+        '''
+        '''
+        add_run.return_value = 999
+        get_completed_file_run.return_value = None
+
+        s3, task_queue, done_queue = mock.Mock(), mock.Mock(), mock.Mock()
+        due_queue, heartbeat_queue = mock.Mock(), mock.Mock()
+        task_queue.__enter__, task_queue.__exit__ = mock.Mock(), mock.Mock()
+        
+        task_queue.get.return_value = None
+        pop_task_from_taskqueue(s3, task_queue, done_queue, due_queue, heartbeat_queue, '', '')
+        
+        self.assertEqual(len(get_completed_file_run.mock_calls), 0, 'Should not have checked for a previous run')
+        self.assertEqual(len(done_queue.mock_calls), 0, 'Should not have pushed to the done queue')
+        self.assertEqual(len(due_queue.mock_calls), 0, 'Should not have pushed to the due queue')
+    
+    @patch('openaddr.ci.WORKER_COOLDOWN', new=timedelta(seconds=0))
+    @patch('openaddr.ci.work.do_work')
+    @patch('openaddr.ci.objects.get_completed_file_run')
+    @patch('openaddr.ci.objects.add_run')
+    def test_pop_task_from_taskqueue_new_run(self, add_run, get_completed_file_run, do_work):
+        '''
+        '''
+        add_run.return_value = 999
+        get_completed_file_run.return_value = None
+
+        s3, task_queue, done_queue = mock.Mock(), mock.Mock(), mock.Mock()
+        due_queue, heartbeat_queue = mock.Mock(), mock.Mock()
+        task_queue.__enter__, task_queue.__exit__ = mock.Mock(), mock.Mock()
+        
+        task_queue.get.return_value.data = dict(job_id='J', url='U', name='N', content_b64='Qw==', commit_sha='S', file_id='F')
+        pop_task_from_taskqueue(s3, task_queue, done_queue, due_queue, heartbeat_queue, '', '')
+        
+        self.assertEqual(len(get_completed_file_run.mock_calls), 1, 'Should have checked for a previous run')
+        self.assertGreaterEqual(len(do_work.mock_calls), 1, 'Should have done some real work')
+        self.assertEqual(len(add_run.mock_calls), 1, 'Should have added a new run')
+        
+        (done_data, ) = done_queue.mock_calls[0][1]
+        (due_data, ) = due_queue.mock_calls[0][1]
+        
+        # All items from task data were passed through to done and due queues
+        for (key, value) in task_queue.get.return_value.data.items():
+            self.assertEqual(done_data[key], value)
+            self.assertEqual(due_data[key], value)
+        
+        # Run ID and work results were also passed through correctly
+        self.assertEqual(done_data['run_id'], add_run.return_value)
+        self.assertEqual(due_data['run_id'], add_run.return_value)
+        self.assertEqual(done_data['result'], do_work.return_value)
+        self.assertNotIn('result', due_data)
+        
+        # Additional values were not added
+        for key in ('set_id', 'rerun'):
+            self.assertIsNone(done_data.get(key, None))
+            self.assertIsNone(due_data.get(key, None))
+    
+    @patch('openaddr.ci.WORKER_COOLDOWN', new=timedelta(seconds=0))
+    @patch('openaddr.ci.work.do_work')
+    @patch('openaddr.ci.objects.get_completed_file_run')
+    @patch('openaddr.ci.objects.add_run')
+    def test_pop_task_from_taskqueue_no_rerun(self, add_run, get_completed_file_run, do_work):
+        '''
+        '''
+        add_run.return_value = 999
+        get_completed_file_run.return_value = None
+
+        s3, task_queue, done_queue = mock.Mock(), mock.Mock(), mock.Mock()
+        due_queue, heartbeat_queue = mock.Mock(), mock.Mock()
+        task_queue.__enter__, task_queue.__exit__ = mock.Mock(), mock.Mock()
+        
+        task_queue.get.return_value.data = dict(rerun=True, job_id='J', url='U', name='N', content_b64='Qw==', commit_sha='S', file_id='F')
+        pop_task_from_taskqueue(s3, task_queue, done_queue, due_queue, heartbeat_queue, '', '')
+        
+        self.assertEqual(len(get_completed_file_run.mock_calls), 0, 'Should not have checked for a previous run')
+        self.assertGreaterEqual(len(do_work.mock_calls), 1, 'Should have done some real work')
+        self.assertEqual(len(add_run.mock_calls), 1, 'Should have added a new run')
+        
+        (done_data, ) = done_queue.mock_calls[0][1]
+        (due_data, ) = due_queue.mock_calls[0][1]
+        
+        # All items from task data were passed through to done and due queues
+        for (key, value) in task_queue.get.return_value.data.items():
+            self.assertEqual(done_data[key], value)
+            self.assertEqual(due_data[key], value)
+        
+        # Run ID and work results were also passed through correctly
+        self.assertEqual(done_data['run_id'], add_run.return_value)
+        self.assertEqual(due_data['run_id'], add_run.return_value)
+        self.assertEqual(done_data['result'], do_work.return_value)
+        self.assertNotIn('result', due_data)
+        
+        # Additional values were not added
+        self.assertIsNone(done_data.get('set_id', None))
+        self.assertIsNone(due_data.get('set_id', None))
+    
+    @patch('openaddr.ci.WORKER_COOLDOWN', new=timedelta(seconds=0))
+    @patch('openaddr.ci.work.do_work')
+    @patch('openaddr.ci.objects.get_completed_file_run')
+    @patch('openaddr.ci.objects.add_run')
+    def test_pop_task_from_taskqueue_with_setid(self, add_run, get_completed_file_run, do_work):
+        '''
+        '''
+        add_run.return_value = 999
+        get_completed_file_run.return_value = None
+
+        s3, task_queue, done_queue = mock.Mock(), mock.Mock(), mock.Mock()
+        due_queue, heartbeat_queue = mock.Mock(), mock.Mock()
+        task_queue.__enter__, task_queue.__exit__ = mock.Mock(), mock.Mock()
+        
+        task_queue.get.return_value.data = dict(set_id=123, job_id='J', url='U', name='N', content_b64='Qw==', commit_sha='S', file_id='F')
+        pop_task_from_taskqueue(s3, task_queue, done_queue, due_queue, heartbeat_queue, '', '')
+        
+        self.assertEqual(len(get_completed_file_run.mock_calls), 1, 'Should have checked for a previous run')
+        self.assertGreaterEqual(len(do_work.mock_calls), 1, 'Should have done some real work')
+        self.assertEqual(len(add_run.mock_calls), 1, 'Should have added a new run')
+        
+        (done_data, ) = done_queue.mock_calls[0][1]
+        (due_data, ) = due_queue.mock_calls[0][1]
+        
+        # All items from task data were passed through to done and due queues
+        for (key, value) in task_queue.get.return_value.data.items():
+            self.assertEqual(done_data[key], value)
+            self.assertEqual(due_data[key], value)
+        
+        # Run ID and work results were also passed through correctly
+        self.assertEqual(done_data['run_id'], add_run.return_value)
+        self.assertEqual(due_data['run_id'], add_run.return_value)
+        self.assertEqual(done_data['result'], do_work.return_value)
+        self.assertNotIn('result', due_data)
+        
+        # Additional values were not added
+        self.assertIsNone(done_data.get('rerun', None))
+        self.assertIsNone(due_data.get('rerun', None))
+    
+    @patch('openaddr.ci.WORKER_COOLDOWN', new=timedelta(seconds=0))
+    @patch('openaddr.ci.work.do_work')
+    @patch('openaddr.ci.objects.copy_run')
+    @patch('openaddr.ci.objects.get_completed_file_run')
+    @patch('openaddr.ci.objects.add_run')
+    def test_pop_task_from_taskqueue_previous_run(self, add_run, get_completed_file_run, copy_run, do_work):
+        '''
+        '''
+        copy_run.return_value = 999
+        get_completed_file_run.return_value = (321, RunState({}), True)
+
+        s3, task_queue, done_queue = mock.Mock(), mock.Mock(), mock.Mock()
+        due_queue, heartbeat_queue = mock.Mock(), mock.Mock()
+        task_queue.__enter__, task_queue.__exit__ = mock.Mock(), mock.Mock()
+        
+        task_queue.get.return_value.data = dict(job_id='J', url='U', name='N', content_b64='Qw==', commit_sha='S', file_id='F')
+        pop_task_from_taskqueue(s3, task_queue, done_queue, due_queue, heartbeat_queue, '', '')
+        
+        self.assertEqual(len(get_completed_file_run.mock_calls), 1, 'Should have checked for a previous run')
+        self.assertEqual(len(add_run.mock_calls), 0, 'Should not have added a new run')
+        self.assertEqual(len(do_work.mock_calls), 0, 'Should not have done any real work')
+        self.assertEqual(len(copy_run.mock_calls), 1, 'Should have copied the previous run')
+        self.assertEqual(len(due_queue.mock_calls), 0, 'Should not have pushed to the due queue')
+        
+        db = task_queue.__enter__.return_value
+        copy_run.assert_called_once_with(db, 321, 'J', 'S', None)
+        
+        (done_data, ) = done_queue.mock_calls[0][1]
+        
+        # All items from task data were passed through to done queue
+        for (key, value) in task_queue.get.return_value.data.items():
+            self.assertEqual(done_data[key], value)
+        
+        # Run ID and work results were also passed through correctly
+        self.assertEqual(done_data['run_id'], copy_run.return_value)
+        self.assertEqual(done_data['result'], {'message': 'Everything is fine', 'reused_run': 321, 'state': {}})
+        
+        # Additional values were not added
+        for key in ('set_id', 'rerun'):
+            self.assertIsNone(done_data.get(key, None))
 
 class TestCollect (unittest.TestCase):
 

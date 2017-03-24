@@ -53,6 +53,11 @@ class Done:
         if self.rerun is not None: data.update(rerun=self.rerun)
         if self.worker_id is not None: data.update(worker_id=self.worker_id)
         if self.set_id is not None: data.update(set_id=self.set_id)
+
+        # Convert RunState to a plain dictionary
+        if data['result'] and 'state' in data['result']:
+            data['result']['state'] = data['result']['state'].to_dict()
+    
         return data
 
 class Heartbeat:

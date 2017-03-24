@@ -4,8 +4,7 @@ from .. import jobs, render, util
 
 from .objects import (
     add_job, write_job, read_job, complete_set, update_set_renders,
-    add_run, set_run, copy_run, read_completed_set_runs, RunState,
-    get_completed_file_run, get_completed_run, new_read_completed_set_runs
+    set_run, RunState, get_completed_run, read_completed_set_runs
     )
 
 from . import objects, work, queuedata
@@ -51,6 +50,7 @@ def load_config():
                 GITHUB_OAUTH_CALLBACK=os.environ.get('GITHUB_CALLBACK'),
                 MEMCACHE_SERVER=os.environ.get('MEMCACHE_SERVER'),
                 DATABASE_URL=os.environ['DATABASE_URL'],
+                DOTMAPS_BASE_URL=os.environ.get('DOTMAPS_BASE_URL'),
                 AWS_S3_BUCKET=os.environ.get('AWS_S3_BUCKET', 'data.openaddresses.io'),
                 WEBHOOK_SECRETS=webhook_secrets)
 
@@ -640,9 +640,9 @@ def enqueue_sources(queue, the_set, sources):
 def _update_expected_paths(db, expected_paths, the_set):
     ''' Discard sources from expected_paths set as they appear in runs table.
     '''
-    for (_, source_path, _, _) in read_completed_set_runs(db, the_set.id):
-        _L.debug(u'Discarding {}'.format(source_path))
-        expected_paths.discard(source_path)
+    for run in read_completed_set_runs(db, the_set.id):
+        _L.debug(u'Discarding {}'.format(run.source_path))
+        expected_paths.discard(run.source_path)
 
 def render_index_maps(s3, runs):
     ''' Render index maps and upload them to S3.
@@ -664,7 +664,7 @@ def render_set_maps(s3, db, the_set):
 
     try:
         s3_prefix = join('/sets', str(the_set.id))
-        runs = new_read_completed_set_runs(db, the_set.id)
+        runs = read_completed_set_runs(db, the_set.id)
         good_sources = _prepare_render_sources(runs, dirname)
         s3_urls = _render_and_upload_maps(s3, good_sources, s3_prefix, dirname)
         update_set_renders(db, the_set.id, *s3_urls)
@@ -860,6 +860,9 @@ def update_job_comments(db, job_id, run_id, github_auth):
             return
     
     comment_json = {'body': '![Preview]({})'.format(run.state.preview)}
+    if 'MACHINE_BASE_URL' in os.environ:
+        job_url = urljoin(os.environ['MACHINE_BASE_URL'], '/jobs/{}'.format(job_id))
+        comment_json['body'] = '{body}\n\nMore: {}'.format(job_url, **comment_json)
     posted = post(job.github_comments_url, data=json.dumps(comment_json), auth=github_auth,
                   headers={'Content-Type': 'application/json'})
     
@@ -942,19 +945,19 @@ def pop_task_from_taskqueue(s3, task_queue, done_queue, due_queue, heartbeat_que
             previous_run = None
         else:
             interval = '{} seconds'.format(RUN_REUSE_TIMEOUT.seconds + RUN_REUSE_TIMEOUT.days * 86400)
-            previous_run = get_completed_file_run(db, taskdata.file_id, interval)
+            previous_run = objects.get_completed_file_run(db, taskdata.file_id, interval)
     
         if previous_run:
             # Make a copy of the previous run.
             previous_run_id, _, _ = previous_run
             copy_args = (passed_on_kwargs[k] for k in ('job_id', 'commit_sha', 'set_id'))
-            passed_on_kwargs['run_id'] = copy_run(db, previous_run_id, *copy_args)
+            passed_on_kwargs['run_id'] = objects.copy_run(db, previous_run_id, *copy_args)
             
             # Don't send a due task, since we will not be doing any actual work.
         
         else:
             # Reserve space for a new run.
-            passed_on_kwargs['run_id'] = add_run(db)
+            passed_on_kwargs['run_id'] = objects.add_run(db)
 
             # Send a Due task, possibly for later.
             due_task = queuedata.Due(**passed_on_kwargs)
@@ -964,7 +967,7 @@ def pop_task_from_taskqueue(s3, task_queue, done_queue, due_queue, heartbeat_que
         # Re-use result from the previous run.
         run_id, state, status = previous_run
         message = work.MAGIC_OK_MESSAGE if status else 'Re-using failed previous run'
-        result = dict(message=message, reused_run=run_id, output=state)
+        result = dict(message=message, reused_run=run_id, state=state)
 
     else:
         # Run the task.
@@ -1004,11 +1007,15 @@ def pop_task_from_donequeue(queue, github_auth):
         if task is None:
             return
     
+        # Convert dictionary into RunState
+        if 'result' in task.data:
+            task.data['result'] = objects.result_dictionary2runstate(task.data['result'])
+        
         donedata = queuedata.Done(**task.data)
         _L.info(u'Got file {} from done queue'.format(donedata.name))
         results = donedata.result
         message = results['message']
-        run_state = RunState(results.get('output', None))
+        run_state = results['state']
         content_b64 = donedata.content_b64
         commit_sha = donedata.commit_sha
         worker_id = donedata.worker_id
